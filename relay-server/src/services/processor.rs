@@ -19,6 +19,7 @@ use relay_base_schema::project::{ProjectId, ProjectKey};
 use relay_cogs::{AppFeature, Cogs, FeatureWeights, ResourceId, Token};
 use relay_common::time::UnixTimestamp;
 use relay_config::{Config, HttpEncoding, UpstreamDescriptor};
+use relay_dynamic_config::Feature;
 use relay_event_normalization::{ClockDriftProcessor, GeoIpLookup};
 use relay_event_schema::processor::ProcessingAction;
 use relay_event_schema::protocol::ClientReport;
@@ -1171,6 +1172,7 @@ impl EnvelopeProcessorService {
     ///
     /// This function runs the following steps:
     ///  - rate limiting
+    ///  - emit billing outcomes
     ///  - submit to `StoreForwarder`
     #[cfg(feature = "processing")]
     async fn encode_metrics_processing(
@@ -1188,12 +1190,23 @@ impl EnvelopeProcessorService {
             ..
         } in message.buckets.into_values()
         {
-            let buckets = self
+            let mut buckets = self
                 .rate_limit_buckets(scoping, &project_info, buckets)
                 .await;
 
             if buckets.is_empty() {
                 continue;
+            }
+
+            if project_info
+                .config
+                .features
+                .has(Feature::GenerateBillingOutcome)
+            {
+                // Emit metric billing outcomes.
+                self.inner
+                    .metric_outcomes
+                    .track_billing_outcome(scoping, &mut buckets);
             }
 
             let retention = project_info

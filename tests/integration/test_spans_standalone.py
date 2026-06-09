@@ -150,8 +150,11 @@ def test_lcp_span(
     project_config["config"]["performanceScore"] = {
         "profiles": performance_score_profiles
     }
+    project_config["config"].setdefault(
+        "features", ["organizations:relay-generate-billing-outcome"]
+    )
     if mode == "v2":
-        project_config["config"].setdefault("features", []).append(
+        project_config["config"]["features"].append(
             "projects:span-v2-experimental-processing"
         )
 
@@ -329,7 +332,7 @@ def test_lcp_span(
             "type": "c",
             "value": 1.0,
             "timestamp": time_within_delta(ts),
-            "tags": {"is_segment": "false"},
+            "tags": {"is_segment": "false", "billing_outcome_accepted": "true"},
             "retention_days": 90,
             "received_at": time_within(ts, precision="s"),
         },
@@ -353,8 +356,12 @@ def test_cls_span(
     project_config["config"]["performanceScore"] = {
         "profiles": performance_score_profiles
     }
+    project_config["config"].setdefault("features", []).append(
+        "organizations:relay-generate-billing-outcome"
+    )
+
     if mode == "v2":
-        project_config["config"].setdefault("features", []).append(
+        project_config["config"]["features"].append(
             "projects:span-v2-experimental-processing"
         )
 
@@ -538,7 +545,7 @@ def test_cls_span(
             "type": "c",
             "value": 1.0,
             "timestamp": time_within_delta(ts),
-            "tags": {"is_segment": "false"},
+            "tags": {"is_segment": "false", "billing_outcome_accepted": "true"},
             "retention_days": 90,
             "received_at": time_within(ts, precision="s"),
         },
@@ -562,6 +569,9 @@ def test_inp_span(
     project_config["config"]["performanceScore"] = {
         "profiles": performance_score_profiles
     }
+    project_config["config"].setdefault("features", []).append(
+        "organizations:relay-generate-billing-outcome"
+    )
     if mode == "v2":
         project_config["config"].setdefault("features", []).append(
             "projects:span-v2-experimental-processing"
@@ -710,7 +720,7 @@ def test_inp_span(
             "type": "c",
             "value": 1.0,
             "timestamp": time_within_delta(ts),
-            "tags": {"is_segment": "false"},
+            "tags": {"is_segment": "false", "billing_outcome_accepted": "true"},
             "retention_days": 90,
             "received_at": time_within(ts, precision="s"),
         },
