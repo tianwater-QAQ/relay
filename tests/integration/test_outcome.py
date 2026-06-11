@@ -256,7 +256,11 @@ def test_outcomes_non_processing(relay, mini_sentry, event_type):
     Send one event that generates an outcome and verify that we get an outcomes batch
     with all necessary information set.
     """
-    config = {"outcomes": {"emit_outcomes": True, "batch_size": 1, "batch_interval": 1}}
+    config = {
+        "outcomes": {
+            "emit_outcomes": True,
+        }
+    }
 
     relay = relay(mini_sentry, config)
 
@@ -305,9 +309,7 @@ def test_outcomes_not_sent_when_disabled(relay, mini_sentry):
     Set batching to a very short interval and verify that we don't receive any outcome
     when we disable outcomes.
     """
-    config = {
-        "outcomes": {"emit_outcomes": False, "batch_size": 1, "batch_interval": 1}
-    }
+    config = {"outcomes": {"emit_outcomes": False}}
 
     relay = relay(mini_sentry, config)
 
@@ -407,8 +409,6 @@ def test_outcome_source(relay, mini_sentry):
     config = {
         "outcomes": {
             "emit_outcomes": True,
-            "batch_size": 1,
-            "batch_interval": 1,
             "source": "my-layer",
         }
     }
@@ -445,8 +445,6 @@ def test_outcome_forwarding(
     processing_config = {
         "outcomes": {
             "emit_outcomes": False,  # The default, overridden by processing.enabled: true
-            "batch_size": 1,
-            "batch_interval": 1,
             "source": "processing-layer",
         }
     }
@@ -457,8 +455,6 @@ def test_outcome_forwarding(
     intermediate_config = {
         "outcomes": {
             "emit_outcomes": True,
-            "batch_size": 1,
-            "batch_interval": 1,
             "source": "intermediate-layer",
         }
     }
@@ -514,8 +510,6 @@ def test_outcomes_forwarding_rate_limited(
     processing_config = {
         "outcomes": {
             "emit_outcomes": True,
-            "batch_size": 1,
-            "batch_interval": 1,
             "source": "processing-layer",
         }
     }
@@ -525,8 +519,6 @@ def test_outcomes_forwarding_rate_limited(
     config_downstream = {
         "outcomes": {
             "emit_outcomes": True,
-            "batch_size": 1,
-            "batch_interval": 1,
             "source": "downstream-layer",
         }
     }
@@ -762,7 +754,7 @@ def test_outcomes_rate_limit(
     Pass a transaction that is rate limited and check whether a rate limit outcome is emitted.
     """
 
-    config = {"outcomes": {"emit_outcomes": True, "batch_size": 1, "batch_interval": 1}}
+    config = {"outcomes": {"emit_outcomes": True}}
     relay = relay_with_processing(config)
     project_id = 42
     project_config = mini_sentry.add_full_project_config(project_id)
@@ -901,9 +893,6 @@ def test_filtered_event_outcome_client_reports(relay, mini_sentry):
             "outcomes": {
                 "emit_outcomes": "as_client_reports",
                 "source": "downstream-layer",
-                "aggregator": {
-                    "flush_interval": 1,
-                },
             }
         },
     )
@@ -931,11 +920,6 @@ def test_filtered_event_outcome_kafka(relay, mini_sentry):
         {
             "outcomes": {
                 "emit_outcomes": True,
-                "batch_size": 1,
-                "batch_interval": 1,
-                "aggregator": {
-                    "flush_interval": 1,
-                },
             }
         },
     )
@@ -1064,8 +1048,6 @@ def test_outcomes_aggregate_inbound_filters(
         {
             "outcomes": {
                 "emit_outcomes": True,
-                "batch_size": 1,
-                "batch_interval": 1,
                 "aggregator": {
                     "flush_interval": 1,
                 },
@@ -1125,8 +1107,6 @@ def test_graceful_shutdown(relay, mini_sentry):
             "limits": {"shutdown_timeout": 1},
             "outcomes": {
                 "emit_outcomes": True,
-                "batch_size": 1,
-                "batch_interval": 1,
                 "aggregator": {
                     "flush_interval": 10,
                 },
@@ -1223,17 +1203,7 @@ def test_profile_outcomes(
     config = {
         "outcomes": {
             "emit_outcomes": True,
-            "batch_size": 1,
-            "batch_interval": 1,
-            "aggregator": {
-                "bucket_interval": 1,
-                "flush_interval": 1,
-            },
             "source": "processing-relay",
-        },
-        "aggregator": {
-            "bucket_interval": 1,
-            "initial_delay": 0,
         },
     }
 
@@ -1354,8 +1324,10 @@ def test_profile_outcomes(
             "source": expected_source,
         },
     ]
+    outcomes = outcomes_consumer.get_aggregated_outcomes(n=12)
+    outcomes.sort(key=lambda o: sorted(o.items()))
 
-    outcomes_consumer.expect_aggregated_outcomes(expected_outcomes)
+    assert outcomes == expected_outcomes, outcomes
 
     metrics = [
         m
@@ -1636,7 +1608,6 @@ def test_profile_outcomes_rate_limited(
         "outcomes": {
             "emit_outcomes": True,
             "aggregator": {
-                "bucket_interval": 1,
                 "flush_interval": 1,
             },
         }
@@ -1766,12 +1737,6 @@ def test_profile_outcomes_rate_limited_when_dynamic_sampling_drops(
     config = {
         "outcomes": {
             "emit_outcomes": True,
-            "batch_size": 1,
-            "batch_interval": 1,
-            "aggregator": {
-                "bucket_interval": 1,
-                "flush_interval": 0,
-            },
         },
     }
 
@@ -1851,17 +1816,7 @@ def test_span_outcomes(
     config = {
         "outcomes": {
             "emit_outcomes": True,
-            "batch_size": 1,
-            "batch_interval": 1,
-            "aggregator": {
-                "bucket_interval": 1,
-                "flush_interval": 1,
-            },
             "source": "processing-relay",
-        },
-        "aggregator": {
-            "bucket_interval": 1,
-            "initial_delay": 0,
         },
     }
 
@@ -1904,6 +1859,9 @@ def test_span_outcomes(
         1: "pop-relay",
         2: "pop-relay",
     }[num_intermediate_relays]
+
+    outcomes = outcomes_consumer.get_aggregated_outcomes(n=10)
+    outcomes.sort(key=lambda o: sorted(o.items()))
 
     expected_outcomes = [
         {
@@ -1955,7 +1913,7 @@ def test_span_outcomes(
         },
     ]
 
-    outcomes_consumer.expect_aggregated_outcomes(expected_outcomes)
+    assert outcomes == expected_outcomes
 
 
 def test_span_outcomes_invalid(
@@ -2059,17 +2017,7 @@ def test_replay_outcomes_item_failed(
     config = {
         "outcomes": {
             "emit_outcomes": True,
-            "batch_size": 1,
-            "batch_interval": 1,
-            "aggregator": {
-                "bucket_interval": 1,
-                "flush_interval": 1,
-            },
             "source": "pop-relay",
-        },
-        "aggregator": {
-            "bucket_interval": 1,
-            "initial_delay": 0,
         },
     }
 
