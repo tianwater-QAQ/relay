@@ -1206,7 +1206,7 @@ impl EnvelopeProcessorService {
                 // Emit metric billing outcomes.
                 self.inner
                     .metric_outcomes
-                    .track_billing_outcome(scoping, &mut buckets);
+                    .track_accepted_outcome(scoping, &mut buckets);
             }
 
             let retention = project_info

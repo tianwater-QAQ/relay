@@ -105,6 +105,9 @@ pub enum Feature {
     /// Stream minidumps to objectstore.
     #[serde(rename = "projects:relay-minidump-uploads")]
     MinidumpUploads,
+    /// Enable relay billing outcome generation.
+    #[serde(rename = "organizations:relay-generate-billing-outcome")]
+    GenerateBillingOutcome,
 
     /// Enables OTLP spans to use the Span V2 processing pipeline in Relay.
     ///
@@ -141,10 +144,6 @@ pub enum Feature {
     #[doc(hidden)]
     #[serde(rename = "organizations:standalone-span-ingestion")]
     DeprecatedStandaloneSpanIngestion,
-
-    /// Enable relay billing outcome generation.
-    #[serde(rename = "organizations:relay-generate-billing-outcome")]
-    GenerateBillingOutcome,
 
     /// Forward compatibility.
     #[doc(hidden)]
