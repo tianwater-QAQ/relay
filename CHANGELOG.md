@@ -4,7 +4,39 @@
 
 **Features**:
 
+- Add Perfetto trace format support for continuous profiling. ([#5659](https://github.com/getsentry/relay/pull/5659))
+- Add metadata support for the `/upload` endpoint. ([#6028](https://github.com/getsentry/relay/pull/6028))
+- Infer user agents and client addresses in the V2 standalone span pipeline. ([#6047](https://github.com/getsentry/relay/pull/6047))
+- Conditionally allow additional exceptions on minidumps. ([#6063](https://github.com/getsentry/relay/pull/6063))
+- Replace nil Trace IDs with random ones. ([#6079](https://github.com/getsentry/relay/pull/6079))
+
+**Bug Fixes**:
+
+- Correctly handle minidump objecstore upload failures. ([#6033](https://github.com/getsentry/relay/pull/6033))
+- Add `client.address` attribute to known IP fields. ([#6058](https://github.com/getsentry/relay/pull/6058))
+- Fix a bug in mobile attribute normalization. ([#6065](https://github.com/getsentry/relay/pull/6065))
+
+**Internal**:
+
+- Restore top-level _performance_issues_spans. ([#6045](https://github.com/getsentry/relay/pull/6045))
+- Update sentry-conventions to 0.11.0, migrating deprecated `gen_ai` attribute constants. ([#6068](https://github.com/getsentry/relay/pull/6068))
+
+## 26.5.2
+
+**Features**:
+
 - Implement mobile measurements calculation for V2 spans. ([#6022](https://github.com/getsentry/relay/pull/6022))
+- Globally enable `sentry-conventions`-based conversion from measurements to attributes and remove the
+  `projects:relay-measurements-smart-conversion` feature flag. ([#6034](https://github.com/getsentry/relay/pull/6034))
+
+**Bug Fixes**:
+
+- Copy user Sentry tags into conventional attributes. ([#6030](https://github.com/getsentry/relay/pull/6030))
+- Do not trim DSC attributes in transaction spans. ([#6038](https://github.com/getsentry/relay/pull/6038))
+
+**Internal**:
+
+- Forwards extracted transaction spans directly to Kafka instead of serializing to an intermediate envelope first. ([#6029](https://github.com/getsentry/relay/pull/6029))
 
 ## 26.5.1
 
@@ -25,9 +57,6 @@
 
 - Add the transaction replay id as an attribute to all contained spans. ([#6017](https://github.com/getsentry/relay/pull/6017))
 - Always allow `Upload-Defer-Length: 1` on the `/upload` endpoint. ([#5977](https://github.com/getsentry/relay/pull/5977))
-
-**Internal**:
-
 - Unconditionally create a trace context with a trace id for errors. ([#6009](https://github.com/getsentry/relay/pull/6009))
 
 ## 26.5.0
@@ -63,7 +92,6 @@
 
 - Implement client/sdk controlled ingestion settings for v2 span, log, and trace metric containers. ([#5881](https://github.com/getsentry/relay/pull/5881), [#5887](https://github.com/getsentry/relay/pull/5887), [#5922](https://github.com/getsentry/relay/pull/5922))
 - Update several `gen_ai` attributes to their latest representation. ([#5798](https://github.com/getsentry/relay/pull/5798))
-- Add Perfetto trace format support for continuous profiling via compound envelope items. ([#5659](https://github.com/getsentry/relay/pull/5659))
 
 **Bug Fixes**:
 

@@ -29,7 +29,7 @@ use crate::services::outcome::DiscardReason;
 use crate::services::store::{Store, StoreAttachment, StoreEnvelope, StoreTraceItem};
 use crate::services::upload::ByteStream;
 use crate::statsd::{RelayCounters, RelayTimers};
-use crate::utils::{BoundedStream, MeteredStream, RetryableStream, TakeOnce};
+use crate::utils::{BoundedStream, MeteredStream, RetryableStream, TakeOnce, find_error_source};
 
 use super::outcome::Outcome;
 
@@ -175,6 +175,9 @@ impl Error {
             type = kind.as_str(),
             attempts = self.attempts.to_string(),
         );
+        if self.kind.is_client_error() {
+            return;
+        }
         relay_log::error!(
             error = &self.kind as &dyn std::error::Error,
             amount = self.amount,
@@ -200,6 +203,8 @@ impl<E: Into<ErrorKind>> From<E> for Error {
 /// Errors that can occur when trying to upload an attachment.
 #[derive(Debug, thiserror::Error)]
 pub enum ErrorKind {
+    #[error("invalid scoping")]
+    InvalidScoping,
     #[error("timeout: {0}")]
     Timeout(#[from] tokio::time::error::Elapsed),
     #[error("load shed")]
@@ -213,10 +218,20 @@ pub enum ErrorKind {
 impl ErrorKind {
     fn as_str(&self) -> &'static str {
         match self {
+            Self::InvalidScoping => "invalid_scoping",
             Self::Timeout(_) => "timeout",
             Self::LoadShed => "load_shed",
             Self::UploadFailed(_) => "upload_failed",
             Self::Uuid(_) => "uuid",
+        }
+    }
+
+    fn is_client_error(&self) -> bool {
+        match self {
+            ErrorKind::UploadFailed(objectstore_client::Error::Reqwest(error)) => {
+                find_error_source(error, is_user_error).is_some()
+            }
+            _ => false,
         }
     }
 }
@@ -397,10 +412,11 @@ impl ObjectstoreServiceInner {
     /// in objectstore.
     async fn handle_envelope(&self, mut envelope: ManagedEnvelope) {
         let scoping = envelope.scoping();
-        let session = self
-            .event_attachments
-            .for_project(scoping.organization_id.value(), scoping.project_id.value())
-            .session(&self.objectstore_client);
+        let session = self.session(
+            &self.event_attachments,
+            scoping.organization_id,
+            scoping.project_id,
+        );
         let retention = envelope.envelope().retention();
 
         let attachments = envelope
@@ -409,7 +425,7 @@ impl ObjectstoreServiceInner {
             .filter(|item| *item.ty() == ItemType::Attachment);
 
         match session {
-            Err(error) => Error::from(error)
+            Err(error) => error
                 .with_amount(attachments.count())
                 .log(MessageKind::Envelope),
             Ok(session) => {
@@ -454,13 +470,14 @@ impl ObjectstoreServiceInner {
         }
 
         let scoping = attachment.scoping();
-        let session = self
-            .event_attachments
-            .for_project(scoping.organization_id.value(), scoping.project_id.value())
-            .session(&self.objectstore_client);
+        let session = self.session(
+            &self.event_attachments,
+            scoping.organization_id,
+            scoping.project_id,
+        );
 
         match session {
-            Err(error) => Error::from(error).log(MessageKind::EventAttachment),
+            Err(error) => error.log(MessageKind::EventAttachment),
             Ok(session) => {
                 let result = self
                     .upload_bytes(
@@ -494,10 +511,11 @@ impl ObjectstoreServiceInner {
     ) -> Result<(), Rejected<Error>> {
         let scoping = managed.scoping();
         let session = self
-            .trace_attachments
-            .for_project(scoping.organization_id.value(), scoping.project_id.value())
-            .session(&self.objectstore_client)
-            .map_err(|e| Error::from(ErrorKind::UploadFailed(e)))
+            .session(
+                &self.trace_attachments,
+                scoping.organization_id,
+                scoping.project_id,
+            )
             .reject(&managed)?;
 
         let body = Bytes::clone(&managed.body);
@@ -553,10 +571,7 @@ impl ObjectstoreServiceInner {
             key,
             stream,
         } = stream;
-        let session = self
-            .event_attachments
-            .for_project(organization_id.value(), project_id.value())
-            .session(&self.objectstore_client)?;
+        let session = self.session(&self.event_attachments, organization_id, project_id)?;
 
         self.upload(
             MessageKind::Stream,
@@ -676,6 +691,21 @@ impl ObjectstoreServiceInner {
     fn should_skip_upload(item: &Item) -> bool {
         item.is_empty() || item.is_attachment_ref()
     }
+
+    fn session(
+        &self,
+        usecase: &Usecase,
+        organization_id: OrganizationId,
+        project_id: ProjectId,
+    ) -> Result<Session, Error> {
+        if organization_id.value() == 0 || project_id.value() == 0 {
+            return Err(ErrorKind::InvalidScoping.into());
+        }
+        let session = usecase
+            .for_project(organization_id.value(), project_id.value())
+            .session(&self.objectstore_client)?;
+        Ok(session)
+    }
 }
 
 /// Common interface for calls to [`ObjectstoreServiceInner::upload`].
@@ -721,5 +751,61 @@ fn is_retryable(error: &objectstore_client::Error) -> bool {
                 )
         }
         _ => false,
+    }
+}
+
+fn is_user_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::FileTooLarge | std::io::ErrorKind::UnexpectedEof
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use relay_system::Service;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn org_zero_rejected() {
+        let service = ObjectstoreService::new(&test_config(), Some(Addr::dummy()))
+            .unwrap()
+            .unwrap();
+        let addr = service.start_detached();
+
+        let stream = BoundedStream::new(
+            MeteredStream::new(futures::stream::empty().boxed(), "test"),
+            0,
+            usize::MAX,
+        );
+
+        let result = addr
+            .send(Stream {
+                organization_id: OrganizationId::new(0),
+                project_id: ProjectId::new(1),
+                key: "my_file".into(),
+                stream,
+            })
+            .await
+            .unwrap();
+        let err = result.unwrap_err();
+
+        assert!(matches!(err.kind, ErrorKind::InvalidScoping));
+    }
+
+    fn test_config() -> ObjectstoreServiceConfig {
+        ObjectstoreServiceConfig {
+            objectstore_url: Some("http://objectstore".to_owned()),
+            max_concurrent_requests: 1,
+            max_backlog: 1,
+            timeout: 1,
+            stream_timeout: 1,
+            retry_delay: 1.0,
+            max_attempts: 1.try_into().unwrap(),
+            auth: None,
+        }
     }
 }

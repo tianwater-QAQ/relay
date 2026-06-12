@@ -5,9 +5,12 @@
 
 use std::collections::BTreeMap;
 
+use bytes::Buf;
+use hashbrown::hash_map::Entry;
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
 use prost::Message;
+use prost::encoding::{self, WireType};
 
 use relay_event_schema::protocol::{Addr, DebugId};
 use relay_protocol::FiniteF64;
@@ -17,6 +20,7 @@ use crate::error::ProfileError;
 use crate::sample::v2::{ProfileData, Sample};
 use crate::sample::{Frame, ThreadMetadata};
 
+#[allow(dead_code)]
 mod proto;
 
 use proto::trace_packet::Data;
@@ -26,6 +30,33 @@ use proto::trace_packet::Data;
 /// produces at most ~6 600 samples per thread; 100 000 provides generous
 /// headroom while bounding memory usage against adversarial input.
 const MAX_SAMPLES: usize = 100_000;
+
+/// Maximum number of top-level Perfetto trace packets we decode before
+/// bailing out.
+///
+/// `MAX_SAMPLES` only counts useful `PerfSample` packets. Valid traces also
+/// need clock snapshots, interned data updates, incremental state resets, and
+/// other metadata packets. The extra 10 000 packets are allocation headroom for
+/// that metadata while keeping the top-level packet vector bounded.
+const MAX_TRACE_PACKETS: usize = MAX_SAMPLES + 10_000;
+
+/// Maximum encoded size of a single top-level Perfetto trace packet.
+///
+/// This bounds allocations from repeated fields inside an individual packet
+/// before handing the packet body to prost for decoding.
+const MAX_TRACE_PACKET_BYTES: usize = 4 * 1024 * 1024;
+
+/// Upper bound on the number of frames in a call stack.
+///
+/// Resolved frame indices are used as keys in a hash map so we should avoid excessive hashing.
+const MAX_CALLSTACK_DEPTH: usize = 1000;
+
+/// Upper bound on joinable path segments.
+///
+/// Prevents excessive string joins.
+const MAX_PATH_SEGMENTS: usize = 100;
+
+const MAX_UNIQUE_FRAMES: usize = 1_000_000;
 
 /// See <https://perfetto.dev/docs/reference/trace-packet-proto#SequenceFlags>.
 const SEQ_INCREMENTAL_STATE_CLEARED: u32 = 1;
@@ -72,6 +103,55 @@ fn extract_clock_offset(cs: &proto::ClockSnapshot) -> Option<i128> {
     }
 }
 
+/// Parse trace packets but limit the amount of packets that end up in the vector.
+///
+/// This prevents memory bombs, as the wire format can be much smaller than the in-memory representation.
+fn decode_trace_packets(
+    mut perfetto_bytes: &[u8],
+) -> Result<Vec<proto::TracePacket>, ProfileError> {
+    let mut packets = Vec::new();
+
+    while perfetto_bytes.has_remaining() {
+        let (tag, wire_type) = encoding::decode_key(&mut perfetto_bytes)
+            .map_err(|_| ProfileError::InvalidSampledProfile)?;
+
+        match (tag, wire_type) {
+            (1, WireType::LengthDelimited) => {
+                if packets.len() >= MAX_TRACE_PACKETS {
+                    return Err(ProfileError::ExceedSizeLimit);
+                }
+
+                let len = encoding::decode_varint(&mut perfetto_bytes)
+                    .map_err(|_| ProfileError::InvalidSampledProfile)?;
+                let len = usize::try_from(len).map_err(|_| ProfileError::ExceedSizeLimit)?;
+
+                if len > MAX_TRACE_PACKET_BYTES {
+                    return Err(ProfileError::ExceedSizeLimit);
+                }
+
+                if len > perfetto_bytes.remaining() {
+                    return Err(ProfileError::InvalidSampledProfile);
+                }
+
+                let packet = proto::TracePacket::decode(&perfetto_bytes[..len])
+                    .map_err(|_| ProfileError::InvalidSampledProfile)?;
+                perfetto_bytes.advance(len);
+                packets.push(packet);
+            }
+            (1, _) => return Err(ProfileError::InvalidSampledProfile),
+            _ => encoding::skip_field(
+                wire_type,
+                tag,
+                &mut perfetto_bytes,
+                encoding::DecodeContext::default(),
+            )
+            .map_err(|_| ProfileError::InvalidSampledProfile)?,
+        }
+    }
+
+    Ok(packets)
+}
+
 /// Per-sequence interned data tables, mirroring Perfetto's incremental state.
 ///
 /// Perfetto traces use interned IDs to avoid repeating large strings and
@@ -90,10 +170,13 @@ struct InternTables {
     frames: HashMap<u64, proto::Frame>,
     callstacks: HashMap<u64, proto::Callstack>,
     mappings: HashMap<u64, proto::Mapping>,
+    callstack_cache: HashMap<u64, usize>,
 }
 
 impl InternTables {
     fn merge(&mut self, data: proto::InternedData) {
+        self.callstack_cache.clear();
+
         let proto::InternedData {
             function_names,
             mapping_paths,
@@ -153,8 +236,7 @@ struct ResolveContext {
 
 /// Converts a Perfetto binary trace into Sample v2 [`ProfileData`] and debug images.
 pub fn convert(perfetto_bytes: &[u8]) -> Result<(ProfileData, Vec<DebugImage>), ProfileError> {
-    let trace =
-        proto::Trace::decode(perfetto_bytes).map_err(|_| ProfileError::InvalidSampledProfile)?;
+    let trace_packets = decode_trace_packets(perfetto_bytes)?;
 
     let mut tables_by_seq: BTreeMap<u32, InternTables> = BTreeMap::new();
     let mut thread_meta: BTreeMap<u32, ThreadMetadata> = BTreeMap::new();
@@ -166,47 +248,50 @@ pub fn convert(perfetto_bytes: &[u8]) -> Result<(ProfileData, Vec<DebugImage>), 
     // against a post-reset intern table. We collect (ts_ns, tid, stack_id)
     // tuples and apply clock offset + sorting after the loop.
     let mut ctx = ResolveContext::default();
-    let mut resolved_samples: Vec<(u64, u32, usize)> = Vec::new();
+    let mut resolved_samples: Vec<ResolvedSample> = Vec::new();
     let mut sample_count: usize = 0;
-    let empty_tables = InternTables::default();
 
-    for packet in trace.packet {
+    for packet in trace_packets {
         let seq_id = trusted_packet_sequence_id(&packet);
 
-        if has_incremental_state_cleared(&packet) && tables_by_seq.contains_key(&seq_id) {
-            tables_by_seq.insert(seq_id, InternTables::default());
+        let intern_tables = tables_by_seq.entry(seq_id).or_default();
+
+        if has_incremental_state_cleared(&packet) {
+            *intern_tables = Default::default();
         }
 
-        if let Some(interned) = packet.interned_data {
-            tables_by_seq.entry(seq_id).or_default().merge(interned);
+        if let Some(interned_data) = packet.interned_data {
+            intern_tables.merge(interned_data);
         }
 
         match packet.data {
             Some(Data::ClockSnapshot(cs)) if clock_offset_ns.is_none() => {
                 clock_offset_ns = extract_clock_offset(&cs);
             }
-            Some(Data::PerfSample(ps)) => {
-                if let Some(callstack_iid) = ps.callstack_iid {
-                    let ts = packet.timestamp.unwrap_or(0);
-                    let tid = ps.tid.unwrap_or(0);
+            Some(Data::PerfSample(sample)) => {
+                if let Some(callstack_iid) = sample.callstack_iid {
+                    let timestamp_ns = packet.timestamp.unwrap_or(0);
+                    let thread_id = sample.tid.unwrap_or(0);
                     if observed_pid.is_none() {
-                        observed_pid = ps.pid;
+                        observed_pid = sample.pid;
                     }
                     sample_count += 1;
-                    if let Some(stack_id) = resolve_callstack(
-                        callstack_iid,
-                        tables_by_seq.get(&seq_id).unwrap_or(&empty_tables),
-                        &mut ctx,
-                    ) {
-                        resolved_samples.push((ts, tid, stack_id));
+                    if sample_count > MAX_SAMPLES {
+                        return Err(ProfileError::ExceedSizeLimit);
+                    }
+
+                    if let Some(stack_id) =
+                        resolve_callstack(callstack_iid, intern_tables, &mut ctx)?
+                    {
+                        resolved_samples.push(ResolvedSample {
+                            timestamp_ns,
+                            thread_id,
+                            stack_id,
+                        });
                     }
                 }
             }
             _ => {}
-        }
-
-        if sample_count > MAX_SAMPLES {
-            return Err(ProfileError::ExceedSizeLimit);
         }
     }
 
@@ -225,13 +310,18 @@ pub fn convert(perfetto_bytes: &[u8]) -> Result<(ProfileData, Vec<DebugImage>), 
 
     let clock_offset_ns = clock_offset_ns.ok_or(ProfileError::InvalidSampledProfile)?;
 
-    resolved_samples.sort_by_key(|s| s.0);
+    resolved_samples.sort_by_key(|s| s.timestamp_ns);
 
     let mut samples: Vec<Sample> = Vec::new();
-    for (ts_ns, tid, stack_id) in resolved_samples {
+    for ResolvedSample {
+        timestamp_ns,
+        thread_id,
+        stack_id,
+    } in resolved_samples
+    {
         // Compute absolute timestamp in integer nanoseconds first, then convert
         // to f64 seconds once to avoid precision loss from adding large floats.
-        let abs_ns = ts_ns as i128 + clock_offset_ns;
+        let abs_ns = timestamp_ns as i128 + clock_offset_ns;
         let ts_secs = abs_ns as f64 / 1_000_000_000.0;
         let ts_secs = (ts_secs * 1000.0).round() / 1000.0;
 
@@ -239,7 +329,7 @@ pub fn convert(perfetto_bytes: &[u8]) -> Result<(ProfileData, Vec<DebugImage>), 
             samples.push(Sample {
                 timestamp: ts,
                 stack_id,
-                thread_id: tid.to_string(),
+                thread_id: thread_id.to_string(),
             });
         }
     }
@@ -265,6 +355,12 @@ pub fn convert(perfetto_bytes: &[u8]) -> Result<(ProfileData, Vec<DebugImage>), 
     ))
 }
 
+struct ResolvedSample {
+    timestamp_ns: u64,
+    thread_id: u32,
+    stack_id: usize,
+}
+
 /// Resolves a callstack iid against the current intern tables, deduplicating
 /// frames and stacks, and collecting debug images for native mappings.
 ///
@@ -272,10 +368,20 @@ pub fn convert(perfetto_bytes: &[u8]) -> Result<(ProfileData, Vec<DebugImage>), 
 /// callstack iid was not found in the tables.
 fn resolve_callstack(
     cs_iid: u64,
-    tables: &InternTables,
+    tables: &mut InternTables,
     ctx: &mut ResolveContext,
-) -> Option<usize> {
-    let callstack = tables.callstacks.get(&cs_iid)?;
+) -> Result<Option<usize>, ProfileError> {
+    if let Some(&stack_id) = tables.callstack_cache.get(&cs_iid) {
+        return Ok(Some(stack_id));
+    }
+
+    let Some(callstack) = tables.callstacks.get(&cs_iid) else {
+        return Ok(None);
+    };
+
+    if callstack.frame_ids.len() > MAX_CALLSTACK_DEPTH {
+        return Err(ProfileError::ExceedSizeLimit);
+    }
 
     let mut resolved_frame_indices: Vec<usize> = Vec::with_capacity(callstack.frame_ids.len());
 
@@ -297,11 +403,18 @@ fn resolve_callstack(
 
         let (key, frame) = build_frame(function_name, pf, tables);
 
-        let idx = *ctx.frame_index.entry(key).or_insert_with(|| {
-            let next_idx = ctx.frames.len();
-            ctx.frames.push(frame);
-            next_idx
-        });
+        let idx = match ctx.frame_index.entry(key) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let next_idx = ctx.frames.len();
+                if next_idx >= MAX_UNIQUE_FRAMES {
+                    return Err(ProfileError::ExceedSizeLimit);
+                }
+                ctx.frames.push(frame);
+                entry.insert(next_idx);
+                next_idx
+            }
+        };
 
         resolved_frame_indices.push(idx);
     }
@@ -318,7 +431,9 @@ fn resolve_callstack(
         id
     };
 
-    Some(stack_id)
+    tables.callstack_cache.insert(cs_iid, stack_id);
+
+    Ok(Some(stack_id))
 }
 
 /// Builds a debug image from a native mapping if not already seen.
@@ -339,7 +454,7 @@ fn collect_debug_image(
         return None;
     }
 
-    let image_addr = mapping.start.unwrap_or(0);
+    let image_addr = mapping.start;
 
     let debug_id = mapping
         .build_id
@@ -349,19 +464,22 @@ fn collect_debug_image(
     // Insert into dedup set only after validating we have a valid debug_id,
     // so that a mapping first seen without a build_id doesn't block a later
     // valid encounter from a different packet sequence.
-    if !seen_images.insert((code_file.clone(), image_addr)) {
+    if !seen_images.insert((code_file.clone(), image_addr.unwrap_or(0))) {
         return None;
     }
 
-    let image_size = mapping.end.unwrap_or(0).saturating_sub(image_addr);
-    let image_vmaddr = mapping.load_bias.unwrap_or(0);
+    let image_size = mapping
+        .end
+        .unwrap_or(0)
+        .saturating_sub(image_addr.unwrap_or(0));
+    let image_vmaddr = mapping.load_bias;
 
     Some(DebugImage {
         code_file: Some(code_file.into()),
         debug_id: Some(debug_id),
         image_type: ImageType::Symbolic,
-        image_addr: Some(Addr(image_addr)),
-        image_vmaddr: Some(Addr(image_vmaddr)),
+        image_addr: image_addr.map(Addr),
+        image_vmaddr: image_vmaddr.map(Addr),
         image_size,
         uuid: None,
     })
@@ -440,6 +558,10 @@ fn build_frame(
 ///
 /// Returns `None` if the mapping has no resolvable path segments.
 fn resolve_mapping_path(mapping: &proto::Mapping, tables: &InternTables) -> Option<String> {
+    if mapping.path_string_ids.len() > MAX_PATH_SEGMENTS {
+        return None;
+    }
+
     let path = mapping
         .path_string_ids
         .iter()
@@ -632,6 +754,11 @@ mod tests {
         trace.encode_to_vec()
     }
 
+    fn write_trace_packet_field_header(bytes: &mut Vec<u8>, len: usize) {
+        encoding::encode_key(1, WireType::LengthDelimited, bytes);
+        encoding::encode_varint(len as u64, bytes);
+    }
+
     #[test]
     fn test_convert_minimal_trace() {
         let bytes = build_minimal_trace();
@@ -690,6 +817,32 @@ mod tests {
     fn test_convert_invalid_protobuf() {
         let result = convert(b"not a valid protobuf");
         assert!(matches!(result, Err(ProfileError::InvalidSampledProfile)));
+    }
+
+    #[test]
+    fn test_decode_trace_packets_exceeds_max_packets() {
+        let mut bytes = Vec::with_capacity((MAX_TRACE_PACKETS + 1) * 2);
+        for _ in 0..=MAX_TRACE_PACKETS {
+            write_trace_packet_field_header(&mut bytes, 0);
+        }
+
+        let result = decode_trace_packets(&bytes);
+        assert!(
+            matches!(result, Err(ProfileError::ExceedSizeLimit)),
+            "expected ExceedSizeLimit, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_trace_packets_exceeds_max_packet_bytes() {
+        let mut bytes = Vec::new();
+        write_trace_packet_field_header(&mut bytes, MAX_TRACE_PACKET_BYTES + 1);
+
+        let result = decode_trace_packets(&bytes);
+        assert!(
+            matches!(result, Err(ProfileError::ExceedSizeLimit)),
+            "expected ExceedSizeLimit, got {result:?}"
+        );
     }
 
     #[test]

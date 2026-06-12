@@ -113,10 +113,9 @@ pub enum Feature {
     /// Stream minidumps to objectstore.
     #[serde(rename = "projects:relay-minidump-uploads")]
     MinidumpUploads,
-    /// When converting measurements into attributes, use the name from the measurement
-    /// definition.
-    #[serde(rename = "projects:relay-measurements-smart-conversion")]
-    MeasurementsSmartConversion,
+    /// Allow additional exceptions to accompany minidumps.
+    #[serde(rename = "projects:minidump-multi-exception")]
+    MinidumpMultiException,
 
     /// Enables OTLP spans to use the Span V2 processing pipeline in Relay.
     ///

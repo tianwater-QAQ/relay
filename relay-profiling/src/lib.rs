@@ -515,6 +515,7 @@ mod tests {
         assert!(result.is_ok(), "expand_perfetto failed: {result:?}");
 
         let expanded = result.unwrap();
+
         assert_eq!(expanded.platform, "android");
         assert_eq!(expanded.profile_type(), ProfileType::Ui);
 
@@ -526,6 +527,8 @@ mod tests {
             !output.metadata.debug_meta.images.is_empty(),
             "expected debug images from native mappings in the fixture"
         );
+
+        insta::assert_json_snapshot!(output);
     }
 
     #[test]

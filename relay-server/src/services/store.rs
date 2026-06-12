@@ -4,16 +4,15 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task;
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
-use futures::FutureExt;
-use futures::future::BoxFuture;
+use chrono::{DateTime, SecondsFormat, Utc};
 use prost::Message as _;
 use sentry_protos::snuba::v1::{TraceItem, TraceItemType};
 use serde::Serialize;
-use serde_json::value::RawValue;
 use uuid::Uuid;
 
 use relay_base_schema::data_category::DataCategory;
@@ -33,13 +32,13 @@ use relay_statsd::metric;
 use relay_system::{Addr, FromMessage, Interface, NoResponse, Service};
 use relay_threading::AsyncPool;
 
-use crate::envelope::{AttachmentPlaceholder, AttachmentType, ContentType, Item, ItemType};
+use crate::envelope::{AttachmentPlaceholder, AttachmentType, Item, ItemType};
 use crate::managed::{Counted, Managed, ManagedEnvelope, OutcomeError, Quantities, Rejected};
 use crate::metrics::{ArrayEncoding, BucketEncoder, MetricOutcomes};
 use crate::processing::profile_chunks::RawProfile;
 use crate::service::ServiceError;
 use crate::services::global_config::GlobalConfigHandle;
-use crate::services::outcome::{DiscardReason, Outcome, TrackOutcome};
+use crate::services::outcome::{self, DiscardReason, Outcome, OutcomeId, TrackOutcome};
 use crate::services::upload::{Final, SignedLocation};
 use crate::statsd::{RelayCounters, RelayGauges, RelayTimers};
 use crate::utils::{self, FormDataIter};
@@ -85,11 +84,7 @@ impl Producer {
     pub fn create(config: &Config) -> anyhow::Result<Self> {
         let mut client_builder = KafkaClient::builder();
 
-        for topic in KafkaTopic::iter().filter(|t| {
-            // Outcomes should not be sent from the store forwarder.
-            // See `KafkaOutcomesProducer`.
-            **t != KafkaTopic::Outcomes && **t != KafkaTopic::OutcomesBilling
-        }) {
+        for topic in KafkaTopic::iter() {
             let kafka_configs = config.kafka_configs(*topic)?;
             client_builder = client_builder
                 .add_kafka_topic_config(*topic, &kafka_configs, config.kafka_validate_topics())
@@ -138,8 +133,13 @@ pub struct StoreSpanV2 {
     pub retention_days: u16,
     /// Downsampled retention of the span.
     pub downsampled_retention_days: u16,
+    /// Optional event id, if the span was extracted from a transaction.
+    pub event_id: Option<EventId>,
     /// The final Sentry compatible span item.
     pub item: SpanV2,
+    // Whether to run issue detection on the transaction or on the segment span.
+    // (only true for segment spans created from a transaction).
+    pub performance_issues_spans: bool,
 }
 
 impl Counted for StoreSpanV2 {
@@ -249,7 +249,7 @@ impl Counted for StoreProfile {
 }
 
 /// The asynchronous thread pool used for scheduling storing tasks in the envelope store.
-pub type StoreServicePool = AsyncPool<BoxFuture<'static, ()>>;
+pub type StoreServicePool = AsyncPool<StoreTask>;
 
 /// Service interface for the [`StoreEnvelope`] message.
 #[derive(Debug)]
@@ -401,11 +401,6 @@ impl StoreService {
     }
 
     fn handle_message(&self, message: Store) {
-        // relay_kafka configures the scope
-        relay_log::with_scope(|_| {}, || self.handle_message_inner(message))
-    }
-
-    fn handle_message_inner(&self, message: Store) {
         let ty = message.variant();
         relay_statsd::metric!(timer(RelayTimers::StoreServiceDuration), message = ty, {
             let result = match message {
@@ -456,7 +451,6 @@ impl StoreService {
         let scoping = managed_envelope.scoping();
 
         let retention = envelope.retention();
-        let downsampled_retention = envelope.downsampled_retention();
 
         let event_id = envelope.event_id();
         let event_item = envelope.as_mut().take_item_by(|item| {
@@ -483,7 +477,6 @@ impl StoreService {
         let mut attachments = Vec::new();
 
         for item in envelope.items() {
-            let content_type = item.content_type();
             match item.ty() {
                 ItemType::Attachment => {
                     if let Some(attachment) = self.produce_attachment(
@@ -537,15 +530,7 @@ impl StoreService {
                         item,
                     )?
                 }
-                ItemType::Span if content_type == Some(ContentType::Json) => self.produce_span(
-                    scoping,
-                    received_at,
-                    event_id,
-                    retention,
-                    downsampled_retention,
-                    item,
-                )?,
-                ty @ ItemType::Log => {
+                ty @ (ItemType::Log | ItemType::Span) => {
                     debug_assert!(
                         false,
                         "received {ty} through an envelope, \
@@ -659,14 +644,8 @@ impl StoreService {
                 .by_size(batch_size)
                 .flatten()
             {
-                let message = self.create_metric_message(
-                    scoping.organization_id,
-                    scoping.project_id,
-                    &mut encoder,
-                    namespace,
-                    &view,
-                    retention,
-                );
+                let message =
+                    self.create_metric_message(&scoping, &mut encoder, namespace, &view, retention);
 
                 let result =
                     message.and_then(|message| self.send_metric_message(namespace, message));
@@ -791,11 +770,12 @@ impl StoreService {
             organization_id: scoping.organization_id,
             project_id: scoping.project_id,
             key_id: scoping.key_id,
-            event_id: None,
+            event_id: message.event_id,
             retention_days: message.retention_days,
             downsampled_retention_days: message.downsampled_retention_days,
             received: datetime_to_timestamp(received_at),
             accepted_outcome_emitted: relay_emits_accepted_outcome,
+            performance_issues_spans: message.performance_issues_spans,
         };
 
         message.try_accept(|span| {
@@ -950,8 +930,7 @@ impl StoreService {
 
     fn create_metric_message<'a>(
         &self,
-        organization_id: OrganizationId,
-        project_id: ProjectId,
+        scoping: &Scoping,
         encoder: &'a mut BucketEncoder,
         namespace: MetricNamespace,
         view: &BucketView<'a>,
@@ -973,8 +952,9 @@ impl StoreService {
         };
 
         Ok(MetricKafkaMessage {
-            org_id: organization_id,
-            project_id,
+            org_id: scoping.organization_id,
+            project_id: scoping.project_id,
+            key_id: scoping.key_id,
             name: view.name(),
             value,
             timestamp: view.timestamp(),
@@ -1222,10 +1202,13 @@ impl StoreService {
     ) -> Result<(), StoreError> {
         let topic = match namespace {
             MetricNamespace::Sessions => KafkaTopic::MetricsSessions,
+            MetricNamespace::Outcomes => {
+                return self.send_metric_based_outcome(message);
+            }
             MetricNamespace::Unsupported => {
-                relay_log::with_scope(
-                    |scope| scope.set_extra("metric_message.name", message.name.as_ref().into()),
-                    || relay_log::error!("store service dropping unknown metric usecase"),
+                relay_log::error!(
+                    metric_message.name = message.name.as_ref(),
+                    "store service dropping unknown metric usecase"
                 );
                 return Ok(());
             }
@@ -1235,6 +1218,52 @@ impl StoreService {
         let headers = BTreeMap::from([("namespace".to_owned(), namespace.to_string())]);
         self.produce(topic, KafkaMessage::Metric { headers, message })?;
         Ok(())
+    }
+
+    fn send_metric_based_outcome(&self, message: MetricKafkaMessage) -> Result<(), StoreError> {
+        let Some(outcome) = outcome::metric::to_outcome_id(message.name) else {
+            relay_log::error!(
+                mri = message.name.as_ref(),
+                "invalid outcome metric, cannot infer outcome id from metric name"
+            );
+            return Ok(());
+        };
+        let quantity = match message.value {
+            MetricValue::Counter(c) => c.to_f64() as u32,
+            v => {
+                relay_log::error!(
+                    mri = message.name.as_ref(),
+                    "invalid outcome metric, expected a counter got '{}'",
+                    v.variant()
+                );
+                return Ok(());
+            }
+        };
+
+        let outcome = OutcomeMessage {
+            timestamp: message
+                .timestamp
+                .as_datetime()
+                .unwrap_or_else(Utc::now)
+                .to_rfc3339_opts(SecondsFormat::Micros, true),
+            org_id: Some(message.org_id).filter(|id| id.value() != 0),
+            project_id: message.project_id,
+            key_id: message.key_id,
+            outcome,
+            reason: message.tags.get("reason").map(|s| s.as_str()),
+            event_id: message.tags.get("event_id").map(|s| s.as_str()),
+            remote_addr: message.tags.get("remote_addr").map(|s| s.as_str()),
+            source: message.tags.get("source").map(|s| s.as_str()),
+            category: message.tags.get("category").and_then(|s| s.parse().ok()),
+            quantity: Some(quantity),
+        };
+
+        let topic = match outcome.outcome.is_billing() {
+            true => KafkaTopic::OutcomesBilling,
+            false => KafkaTopic::Outcomes,
+        };
+
+        self.produce(topic, KafkaMessage::Outcome(outcome))
     }
 
     fn produce_profile(
@@ -1289,88 +1318,6 @@ impl StoreService {
 
         Ok(())
     }
-
-    fn produce_span(
-        &self,
-        scoping: Scoping,
-        received_at: DateTime<Utc>,
-        event_id: Option<EventId>,
-        retention_days: u16,
-        downsampled_retention_days: u16,
-        item: &Item,
-    ) -> Result<(), StoreError> {
-        debug_assert_eq!(item.ty(), &ItemType::Span);
-        debug_assert_eq!(item.content_type(), Some(ContentType::Json));
-
-        let Scoping {
-            organization_id,
-            project_id,
-            project_key: _,
-            key_id,
-        } = scoping;
-
-        let relay_emits_accepted_outcome = !utils::is_rolled_out(
-            scoping.organization_id.value(),
-            self.global_config
-                .current()
-                .unwrap_or_default()
-                .options
-                .eap_span_outcomes_rollout_rate,
-        )
-        .is_keep();
-
-        let payload = item.payload();
-        let message = SpanKafkaMessageRaw {
-            meta: SpanMeta {
-                organization_id,
-                project_id,
-                key_id,
-                event_id,
-                retention_days,
-                downsampled_retention_days,
-                received: datetime_to_timestamp(received_at),
-                accepted_outcome_emitted: relay_emits_accepted_outcome,
-            },
-            span: serde_json::from_slice(&payload)
-                .map_err(|e| StoreError::EncodingFailed(e.into()))?,
-        };
-
-        // Verify that this is a V2 span:
-        debug_assert!(message.span.contains_key("attributes"));
-        relay_statsd::metric!(
-            counter(RelayCounters::SpanV2Produced) += 1,
-            via = "envelope"
-        );
-
-        self.produce(
-            KafkaTopic::Spans,
-            KafkaMessage::SpanRaw {
-                routing_key: item.routing_hint(),
-                headers: BTreeMap::from([(
-                    "project_id".to_owned(),
-                    scoping.project_id.to_string(),
-                )]),
-                message,
-                org_id: organization_id,
-            },
-        )?;
-
-        if relay_emits_accepted_outcome {
-            // XXX: Temporarily produce span outcomes. Keep in sync with either EAP
-            // or the segments consumer, depending on which will produce outcomes later.
-            self.outcome_aggregator.send(TrackOutcome {
-                category: DataCategory::SpanIndexed,
-                event_id: None,
-                outcome: Outcome::Accepted,
-                quantity: 1,
-                remote_addr: None,
-                scoping,
-                timestamp: received_at,
-            });
-        }
-
-        Ok(())
-    }
 }
 
 impl Service for StoreService {
@@ -1382,15 +1329,33 @@ impl Service for StoreService {
         relay_log::info!("store forwarder started");
 
         while let Some(message) = rx.recv().await {
-            let service = Arc::clone(&this);
-            // For now, we run each task synchronously, in the future we might explore how to make
-            // the store async.
-            this.pool
-                .spawn_async(async move { service.handle_message(message) }.boxed())
-                .await;
+            let task = StoreTask {
+                service: Arc::clone(&this),
+                message: Some(message),
+            };
+            this.pool.spawn_async(task).await;
         }
 
         relay_log::info!("store forwarder stopped");
+    }
+}
+
+/// Task executed by [`StoreService`].
+pub struct StoreTask {
+    service: Arc<StoreService>,
+    message: Option<Store>,
+}
+
+impl Future for StoreTask {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _: &mut task::Context<'_>) -> task::Poll<Self::Output> {
+        let message = self
+            .message
+            .take()
+            .expect("StoreTask polled after completion");
+        let () = relay_log::with_scope(|_| {}, || self.service.handle_message(message));
+        task::Poll::Ready(())
     }
 }
 
@@ -1565,6 +1530,8 @@ struct UserReportKafkaMessage {
 struct MetricKafkaMessage<'a> {
     org_id: OrganizationId,
     project_id: ProjectId,
+    #[serde(skip)]
+    key_id: Option<u64>,
     name: &'a MetricName,
     #[serde(flatten)]
     value: MetricValue<'a>,
@@ -1605,6 +1572,41 @@ impl MetricValue<'_> {
             _ => None,
         }
     }
+}
+
+/// Raw representation of an outcome for Kafka.
+#[derive(Debug, Serialize, Clone)]
+pub struct OutcomeMessage<'a> {
+    /// The timespan of the event outcome.
+    timestamp: String,
+    /// Organization id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org_id: Option<OrganizationId>,
+    /// Project id.
+    project_id: ProjectId,
+    /// The DSN project key id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_id: Option<u64>,
+    /// The outcome.
+    outcome: OutcomeId,
+    /// Reason for the outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+    /// The event id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
+    /// The client ip address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_addr: Option<&'a str>,
+    /// The source of the outcome (which Relay sent it)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'a str>,
+    /// The event's data category.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<u8>,
+    /// The number of events or total attachment size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quantity: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1656,14 +1658,6 @@ struct CheckInKafkaMessage {
 }
 
 #[derive(Debug, Serialize)]
-struct SpanKafkaMessageRaw<'a> {
-    #[serde(flatten)]
-    meta: SpanMeta,
-    #[serde(flatten)]
-    span: BTreeMap<&'a str, &'a RawValue>,
-}
-
-#[derive(Debug, Serialize)]
 struct SpanKafkaMessage<'a> {
     #[serde(flatten)]
     meta: SpanMeta,
@@ -1688,6 +1682,13 @@ struct SpanMeta {
     downsampled_retention_days: u16,
     /// Indicates whether Relay already emitted an accepted outcome or if EAP still needs to emit it.
     accepted_outcome_emitted: bool,
+    /// Whether the segment span should be used for issue detection instead of the transaction.
+    #[serde(rename = "_performance_issues_spans", skip_serializing_if = "is_false")]
+    performance_issues_spans: bool,
+}
+
+fn is_false(val: &bool) -> bool {
+    !val
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1727,18 +1728,6 @@ enum KafkaMessage<'a> {
         #[serde(skip)]
         message: TraceItem,
     },
-    SpanRaw {
-        #[serde(skip)]
-        routing_key: Option<Uuid>,
-        #[serde(skip)]
-        headers: BTreeMap<String, String>,
-        #[serde(flatten)]
-        message: SpanKafkaMessageRaw<'a>,
-
-        /// Used for [`KafkaMessage::key`]
-        #[serde(skip)]
-        org_id: OrganizationId,
-    },
     SpanV2 {
         #[serde(skip)]
         routing_key: Option<Uuid>,
@@ -1759,6 +1748,8 @@ enum KafkaMessage<'a> {
     ProfileChunk(ProfileChunkKafkaMessage),
 
     ReplayRecordingNotChunked(ReplayRecordingNotChunkedKafkaMessage<'a>),
+
+    Outcome(OutcomeMessage<'a>),
 }
 
 impl KafkaMessage<'_> {
@@ -1786,10 +1777,11 @@ impl Message for KafkaMessage<'_> {
                 MetricNamespace::Spans => "metric_spans",
                 MetricNamespace::Transactions => "metric_transactions",
                 MetricNamespace::Custom => "metric_custom",
+                MetricNamespace::Outcomes => "metric_outcomes",
                 MetricNamespace::Unsupported => "metric_unsupported",
             },
             KafkaMessage::CheckIn(_) => "check_in",
-            KafkaMessage::SpanRaw { .. } | KafkaMessage::SpanV2 { .. } => "span",
+            KafkaMessage::SpanV2 { .. } => "span",
             KafkaMessage::Item { item_type, .. } => item_type.as_str_name(),
 
             KafkaMessage::Attachment(_) => "attachment",
@@ -1799,6 +1791,8 @@ impl Message for KafkaMessage<'_> {
             KafkaMessage::ProfileChunk(_) => "profile_chunk",
 
             KafkaMessage::ReplayRecordingNotChunked(_) => "replay_recording_not_chunked",
+
+            KafkaMessage::Outcome(_) => "outcome",
         }
     }
 
@@ -1807,12 +1801,7 @@ impl Message for KafkaMessage<'_> {
         match self {
             Self::Event(message) => Some((message.event_id.0, message.org_id)),
             Self::UserReport(message) => Some((message.event_id.0, message.org_id)),
-            Self::SpanRaw {
-                routing_key,
-                org_id,
-                ..
-            }
-            | Self::SpanV2 {
+            Self::SpanV2 {
                 routing_key,
                 org_id,
                 ..
@@ -1832,7 +1821,8 @@ impl Message for KafkaMessage<'_> {
             | Self::Item { .. }
             | Self::Profile(_)
             | Self::ProfileChunk(_)
-            | Self::ReplayRecordingNotChunked(_) => None,
+            | Self::ReplayRecordingNotChunked(_)
+            | Self::Outcome(_) => None,
         }
         .filter(|(uuid, _)| !uuid.is_nil())
         .map(|(uuid, org_id)| {
@@ -1849,7 +1839,6 @@ impl Message for KafkaMessage<'_> {
     fn headers(&self) -> Option<&BTreeMap<String, String>> {
         match &self {
             KafkaMessage::Metric { headers, .. }
-            | KafkaMessage::SpanRaw { headers, .. }
             | KafkaMessage::SpanV2 { headers, .. }
             | KafkaMessage::Item { headers, .. }
             | KafkaMessage::Profile(ProfileKafkaMessage { headers, .. })
@@ -1860,14 +1849,14 @@ impl Message for KafkaMessage<'_> {
             | KafkaMessage::CheckIn(_)
             | KafkaMessage::Attachment(_)
             | KafkaMessage::AttachmentChunk(_)
-            | KafkaMessage::ReplayRecordingNotChunked(_) => None,
+            | KafkaMessage::ReplayRecordingNotChunked(_)
+            | KafkaMessage::Outcome(_) => None,
         }
     }
 
     fn serialize(&self) -> Result<SerializationOutput<'_>, ClientError> {
         match self {
             KafkaMessage::Metric { message, .. } => serialize_as_json(message),
-            KafkaMessage::SpanRaw { message, .. } => serialize_as_json(message),
             KafkaMessage::SpanV2 { message, .. } => serialize_as_json(message),
             KafkaMessage::Item { message, .. } => {
                 let mut payload = Vec::new();
@@ -1876,6 +1865,7 @@ impl Message for KafkaMessage<'_> {
                     Err(_) => Err(ClientError::ProtobufEncodingFailed),
                 }
             }
+            KafkaMessage::Outcome(outcome) => serialize_as_json(outcome),
             KafkaMessage::Event(_)
             | KafkaMessage::UserReport(_)
             | KafkaMessage::CheckIn(_)
